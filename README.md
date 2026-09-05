@@ -8,5 +8,6 @@ Superior performance for 900 MHz (ISM), 1090 MHz (ADS-B), 1.5 GHz (GPS), and 2.4
 
 Various types of charts support, including 1001 points Smith chart, via a Python-based graphical user interface (GUI).
 
-<img width="1919" height="1043" alt="Test_GUI" src="https://github.com/user-attachments/assets/89a1c721-409b-455d-89ac-acd1679b8b6b" />
+<img width="1919" height="1037" alt="Test_GUI_2" src="https://github.com/user-attachments/assets/461190e9-6006-43bc-b6ed-f9cdde8b5ff7" />
+
 
