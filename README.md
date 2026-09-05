@@ -6,7 +6,7 @@ Superior performance for 900 MHz (ISM), 1090 MHz (ADS-B), 1.5 GHz (GPS), and 2.4
 
 <img width="4032" height="3024" alt="Pico_Top" src="https://github.com/user-attachments/assets/4c98a4e1-3f14-427b-9f6a-2cd1670a24f9" />
 
-Various types of charts support, including 1001 points Smith chart, via a Python-based graphical user interface (GUI).
+Various types of charts support, including 1001 points Smith chart, via a Python-based (PyQt6) custom graphical user interface (GUI).
 
 <img width="1919" height="1037" alt="Test_GUI_2" src="https://github.com/user-attachments/assets/461190e9-6006-43bc-b6ed-f9cdde8b5ff7" />
 
