@@ -4,7 +4,7 @@ import uselect
 from machine import Pin, SPI, I2S, PWM, freq
 import time
 
-# Set CPU to 144 MHz
+# Set CPU to exactly 144 MHz
 freq(144_000_000) 
 
 class ADF4351:
@@ -22,14 +22,9 @@ class ADF4351:
         self.cs.value(1)
         
     def init_registers(self):
-        self.write_reg(0x00580005) # Reg 5: Default
-        
-        # Reg 3: Enable Dither (Bit 3) + High Band Select Clock Mode for 32MHz PFD (Bit 23)
-        self.write_reg(0x0080000B) 
-        
-        # Reg 2: Low Spur Mode (Bits 30-29=11), Digital Lock Detect (Bits 28-26=110), 
-        # Max Charge Pump Current 5.0mA (Bits 12-9=1111) to forcefully stabilize the VCO against pulling.
-        self.write_reg(0x78005E42) 
+        self.write_reg(0x00580005) 
+        self.write_reg(0x0000000B) 
+        self.write_reg(0x18004E42) 
 
     def set_frequency(self, freq_mhz, power_level=3):
         vco = float(freq_mhz)
@@ -93,22 +88,25 @@ try:
                     freq_lo = struct.unpack('<f', freq_bytes)[0]
                     freq_rf = freq_lo + IF_OFFSET_MHZ
                     
-                    # LO stays at max power (3). RF drops to minimum power (0) to starve the reflection wave.
                     synth_lo.set_frequency(freq_lo, power_level=3)
-                    synth_rf.set_frequency(freq_rf, power_level=0)
+                    synth_rf.set_frequency(freq_rf, power_level=2)
                     
                     # 1. Active Digital Lock Polling
+                    # Actively drain the buffer so it does not fill up while waiting for the silicon to assert the lock pins.
                     t_start = time.ticks_ms()
                     while lock_lo.value() == 0 or lock_rf.value() == 0:
                         audio.readinto(i2s_buf)
                         if time.ticks_diff(time.ticks_ms(), t_start) > 50:
                             break
                     
-                    # 2. Active Analog Settling Delay (27.3ms loop filter stabilization)
+                    # 2. Active Analog Settling Delay
+                    # Each readinto() blocks for exactly 2.73ms. Looping 10 times yields a perfect 27.3ms delay.
+                    # The I2S hardware buffer remains completely empty the entire time.
                     for _ in range(10):
                         audio.readinto(i2s_buf) 
                     
                     # 3. Final Capture
+                    # Read the pristine, aligned, steady-state sine wave.
                     audio.readinto(i2s_buf) 
                     
                     sys.stdout.buffer.write(b'VNA1')

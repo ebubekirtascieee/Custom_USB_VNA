@@ -6,11 +6,11 @@ import pyqtgraph as pg
 import pyqtgraph.exporters
 import serial
 import serial.tools.list_ports
-from scipy.signal import butter, filtfilt, resample, medfilt
+from scipy.signal import butter, filtfilt, resample, medfilt, find_peaks, get_window
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
                              QWidget, QPushButton, QLabel, QDoubleSpinBox, QGroupBox,
                              QComboBox, QMessageBox, QFileDialog, QLineEdit, QTableWidget,
-                             QTableWidgetItem, QHeaderView)
+                             QTableWidgetItem, QHeaderView, QTabWidget)
 from PyQt6.QtCore import QTimer, Qt
 
 
@@ -23,7 +23,7 @@ def interp_complex(x_new, x_old, y_complex):
 class VNAMaster(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VNA Metrology Engine: S11 Analysis & Smith Chart")
+        self.setWindowTitle("VNA Metrology Engine: S11, Port Extension & TDR")
         self.resize(1600, 950)
         self.port = None
         self.rx_buffer = bytearray()
@@ -52,6 +52,9 @@ class VNAMaster(QMainWindow):
         self.base_E_T = None
 
         self.markers = []
+        self.tdr_markers = []
+        self.tdr_d_array = np.array([])
+        self.tdr_mag_array = np.array([])
 
         central_widget = QWidget()
         layout = QVBoxLayout(central_widget)
@@ -101,15 +104,22 @@ class VNAMaster(QMainWindow):
         control_layout = QHBoxLayout()
         self.spin_start = QDoubleSpinBox()
         self.spin_start.setRange(50.0, 4400.0)
-        self.spin_start.setValue(600.0)
+        self.spin_start.setValue(400.0)
         self.spin_stop = QDoubleSpinBox()
         self.spin_stop.setRange(50.0, 4400.0)
-        self.spin_stop.setValue(2700.0)
+        self.spin_stop.setValue(3000.0)
         self.combo_pts = QComboBox()
         self.combo_pts.addItems(["101", "201", "501", "1001"])
         self.combo_pts.setCurrentText("1001")
         self.combo_filter = QComboBox()
         self.combo_filter.addItems(["Off", "3 (Light)", "5 (Medium)", "11 (Aggressive)"])
+
+        self.spin_ed = QDoubleSpinBox()
+        self.spin_ed.setRange(-5000.0, 5000.0)
+        self.spin_ed.setValue(0.0)
+        self.spin_ed.setSuffix(" ps")
+        self.spin_ed.setToolTip("Port Extension (One-way electrical delay)")
+
         self.btn_normal = QPushButton("Start Sweep")
         self.btn_normal.setStyleSheet("background-color: #005577; color: white;")
         self.btn_normal.clicked.connect(lambda: self.start_sweep('NORMAL'))
@@ -119,6 +129,7 @@ class VNAMaster(QMainWindow):
         self.btn_toggle_adc = QPushButton("Hide ADC")
         self.btn_toggle_adc.setCheckable(True)
         self.btn_toggle_adc.clicked.connect(self.toggle_adc)
+
         control_layout.addWidget(QLabel("Start:"))
         control_layout.addWidget(self.spin_start)
         control_layout.addWidget(QLabel("Stop:"))
@@ -127,6 +138,8 @@ class VNAMaster(QMainWindow):
         control_layout.addWidget(self.combo_pts)
         control_layout.addWidget(QLabel("Filter:"))
         control_layout.addWidget(self.combo_filter)
+        control_layout.addWidget(QLabel("Delay:"))
+        control_layout.addWidget(self.spin_ed)
         control_layout.addWidget(self.btn_normal)
         control_layout.addWidget(self.btn_stop)
         control_layout.addWidget(self.btn_toggle_adc)
@@ -159,7 +172,9 @@ class VNAMaster(QMainWindow):
         self.info_label.setStyleSheet("color: #FF5555; background-color: #111; padding: 10px; font-size: 14pt;")
         layout.addWidget(self.info_label)
 
-        # --- VIEWPORT: Split into Metrology (S11 + Table) and ADC ---
+        self.tabs = QTabWidget()
+
+        # === TAB 1: METROLOGY (S11) ===
         self.metrology_panel = QWidget()
         metrology_layout = QHBoxLayout(self.metrology_panel)
         metrology_layout.setContentsMargins(0, 0, 0, 0)
@@ -207,8 +222,98 @@ class VNAMaster(QMainWindow):
         marker_layout.addWidget(self.marker_table)
         metrology_layout.addWidget(marker_panel, stretch=1)
 
-        layout.addWidget(self.metrology_panel, stretch=2)
+        self.tabs.addTab(self.metrology_panel, "Frequency Domain (S11)")
 
+        # === TAB 2: TIME DOMAIN REFLECTOMETRY (TDR) & CABLE LOSS ===
+        self.tdr_panel = QWidget()
+        tdr_layout = QVBoxLayout(self.tdr_panel)
+        tdr_layout.setContentsMargins(0, 0, 0, 0)
+
+        tdr_controls = QHBoxLayout()
+        self.spin_vf = QDoubleSpinBox()
+        self.spin_vf.setRange(0.1, 1.0)
+        self.spin_vf.setValue(0.66)
+        self.spin_vf.setSingleStep(0.01)
+        self.combo_window = QComboBox()
+        self.combo_window.addItems(["hann", "hamming", "blackman", "rectangular"])
+        self.btn_calc_tdr = QPushButton("Compute TDR & Extract Cable Loss")
+        self.btn_calc_tdr.setStyleSheet("background-color: #550077; color: white;")
+        self.btn_calc_tdr.clicked.connect(self.update_tdr)
+
+        tdr_controls.addWidget(QLabel("Velocity Factor (VF):"))
+        tdr_controls.addWidget(self.spin_vf)
+        tdr_controls.addWidget(QLabel("Window:"))
+        tdr_controls.addWidget(self.combo_window)
+        tdr_controls.addWidget(self.btn_calc_tdr)
+        tdr_controls.addStretch()
+        tdr_layout.addLayout(tdr_controls)
+
+        tdr_body = QHBoxLayout()
+
+        # Left Panel: Distance Plot & Loss Plot
+        tdr_left_panel = QWidget()
+        tdr_left_layout = QVBoxLayout(tdr_left_panel)
+        tdr_left_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.tdr_graph = pg.PlotWidget(title="Distance to Fault (Magnitude vs Meters)")
+        self.tdr_graph.showGrid(x=True, y=True, alpha=0.4)
+        self.tdr_graph.setLabel('bottom', "Distance", units='m')
+        self.c_tdr = self.tdr_graph.plot(pen=pg.mkPen('g', width=2))
+        self.tdr_line = pg.InfiniteLine(pos=0, angle=90, movable=False, pen=pg.mkPen('r', style=Qt.PenStyle.DashLine))
+        self.tdr_graph.addItem(self.tdr_line)
+        self.tdr_graph.scene().sigMouseClicked.connect(self.on_tdr_mouse_click)
+
+        self.loss_graph = pg.PlotWidget(title="Extracted Cable Loss (dB/m vs Frequency)")
+        self.loss_graph.showGrid(x=True, y=True, alpha=0.4)
+        self.loss_graph.setLabel('bottom', "Frequency (MHz)")
+        self.loss_graph.setLabel('left', "Loss (dB/m)")
+        # Raw mathematical loss (faded gray)
+        self.c_loss_raw = self.loss_graph.plot(pen=pg.mkPen(color=(150, 150, 150), width=1, style=Qt.PenStyle.DashLine))
+        # Polynomial fit smoothing (bright yellow)
+        self.c_loss_fit = self.loss_graph.plot(pen=pg.mkPen('y', width=2))
+
+        tdr_left_layout.addWidget(self.tdr_graph)
+        tdr_left_layout.addWidget(self.loss_graph)
+
+        # Right Panel: Tables
+        tdr_right_panel = QWidget()
+        tdr_right_layout = QVBoxLayout(tdr_right_panel)
+        tdr_right_layout.setContentsMargins(0, 0, 0, 0)
+
+        tdr_right_layout.addWidget(QLabel("Auto Detected Faults:"))
+        self.tdr_fault_table = QTableWidget(0, 3)
+        self.tdr_fault_table.setHorizontalHeaderLabels(["ID", "Distance (m)", "Reflection Amp"])
+        self.tdr_fault_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tdr_fault_table.itemDoubleClicked.connect(self.on_tdr_double_click)
+        tdr_right_layout.addWidget(self.tdr_fault_table)
+
+        tdr_right_layout.addWidget(QLabel("Manual Markers:"))
+        tdr_m_ctrl = QHBoxLayout()
+        self.spin_tdr_marker = QDoubleSpinBox()
+        self.spin_tdr_marker.setRange(0.0, 5000.0)
+        self.spin_tdr_marker.setValue(1.0)
+        self.btn_add_tdr_marker = QPushButton("Add")
+        self.btn_add_tdr_marker.clicked.connect(lambda: self.add_tdr_marker())
+        self.btn_clear_tdr_markers = QPushButton("Clear")
+        self.btn_clear_tdr_markers.clicked.connect(self.clear_tdr_markers)
+        tdr_m_ctrl.addWidget(self.spin_tdr_marker)
+        tdr_m_ctrl.addWidget(self.btn_add_tdr_marker)
+        tdr_m_ctrl.addWidget(self.btn_clear_tdr_markers)
+        tdr_right_layout.addLayout(tdr_m_ctrl)
+
+        self.tdr_marker_table = QTableWidget(0, 3)
+        self.tdr_marker_table.setHorizontalHeaderLabels(["ID", "Distance (m)", "Amplitude"])
+        self.tdr_marker_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        tdr_right_layout.addWidget(self.tdr_marker_table)
+
+        tdr_body.addWidget(tdr_left_panel, stretch=3)
+        tdr_body.addWidget(tdr_right_panel, stretch=1)
+        tdr_layout.addLayout(tdr_body)
+
+        self.tabs.addTab(self.tdr_panel, "Time Domain (TDR) & Diagnostics")
+        layout.addWidget(self.tabs, stretch=2)
+
+        # === ADC PANEL ===
         self.adc_panel = QWidget()
         adc_layout = QVBoxLayout(self.adc_panel)
         adc_layout.setContentsMargins(0, 0, 0, 0)
@@ -281,6 +386,13 @@ class VNAMaster(QMainWindow):
             elif self.p_phase.vb.sceneBoundingRect().contains(pos):
                 mousePoint = self.p_phase.vb.mapSceneToView(pos)
                 self.add_marker(mousePoint.x())
+
+    def on_tdr_mouse_click(self, event):
+        if event.double():
+            pos = event.scenePos()
+            if self.tdr_graph.vb.sceneBoundingRect().contains(pos):
+                mousePoint = self.tdr_graph.vb.mapSceneToView(pos)
+                self.add_tdr_marker(mousePoint.x())
 
     def add_marker(self, freq=None):
         if freq is None: freq = self.spin_marker.value()
@@ -359,6 +471,44 @@ class VNAMaster(QMainWindow):
             self.marker_table.setItem(i, 2, QTableWidgetItem(mag_str))
             self.marker_table.setItem(i, 3, QTableWidgetItem(ph_str))
             self.marker_table.setItem(i, 4, QTableWidgetItem(z_str))
+
+    def add_tdr_marker(self, dist=None):
+        if dist is None: dist = self.spin_tdr_marker.value()
+        dist = max(0.0, dist)
+
+        m_id = f"T{len(self.tdr_markers) + 1}"
+        line = pg.InfiniteLine(pos=dist, angle=90, movable=True, pen=pg.mkPen('c', width=2))
+        pg.InfLineLabel(line, text=m_id, position=0.95, color='c')
+
+        self.tdr_graph.addItem(line)
+
+        def on_move(l):
+            self.spin_tdr_marker.setValue(l.value())
+            self.update_tdr_marker_table()
+
+        line.sigPositionChanged.connect(on_move)
+
+        self.tdr_markers.append({'id': m_id, 'line': line})
+        self.tdr_marker_table.setRowCount(len(self.tdr_markers))
+        self.update_tdr_marker_table()
+
+    def clear_tdr_markers(self):
+        for m in self.tdr_markers:
+            self.tdr_graph.removeItem(m['line'])
+        self.tdr_markers.clear()
+        self.tdr_marker_table.setRowCount(0)
+
+    def update_tdr_marker_table(self):
+        for i, m in enumerate(self.tdr_markers):
+            dist = m['line'].value()
+            amp_str = "---"
+            if len(self.tdr_d_array) > 1 and self.tdr_d_array[0] <= dist <= self.tdr_d_array[-1]:
+                amp = np.interp(dist, self.tdr_d_array, self.tdr_mag_array)
+                amp_str = f"{amp:.4f}"
+
+            self.tdr_marker_table.setItem(i, 0, QTableWidgetItem(m['id']))
+            self.tdr_marker_table.setItem(i, 1, QTableWidgetItem(f"{dist:.3f}"))
+            self.tdr_marker_table.setItem(i, 2, QTableWidgetItem(amp_str))
 
     def export_s1p(self):
         name = self.input_img_name.text().strip()
@@ -450,7 +600,9 @@ class VNAMaster(QMainWindow):
         name = self.input_img_name.text().strip()
         if not name: name = "VNA_S11_Export"
         if not name.lower().endswith(".png"): name += ".png"
-        pixmap = self.metrology_panel.grab()
+
+        current_widget = self.tabs.currentWidget()
+        pixmap = current_widget.grab()
         try:
             pixmap.save(name)
             QMessageBox.information(self, "Success", f"Dashboard saved as {name}")
@@ -473,8 +625,8 @@ class VNAMaster(QMainWindow):
 
         if mode == 'NORMAL' and self.is_calibrated:
             if start_f < self.cal_freq_array[0] or stop_f > self.cal_freq_array[-1]:
-                QMessageBox.critical(self, "Extrapolation Error",
-                                     "Cannot sweep outside calibrated bounds. Zoom in or re-calibrate.")
+                QMessageBox.critical(self, "Calibration Error",
+                                     f"Sweep range ({start_f} - {stop_f} MHz) is OUTSIDE the calibrated bounds ({self.cal_freq_array[0]:.1f} - {self.cal_freq_array[-1]:.1f} MHz).\nPlease adjust sweep bounds or re-calibrate.")
                 return
             if pts > len(self.cal_freq_array):
                 QMessageBox.warning(self, "Upscaling Warning",
@@ -508,6 +660,100 @@ class VNAMaster(QMainWindow):
         self.info_label.setStyleSheet("color: #FFFF00; background-color: #111;")
         self.request_next_point()
 
+    def update_tdr(self):
+        if self.is_sweeping:
+            QMessageBox.warning(self, "Sweep In Progress",
+                                "Please wait for the frequency sweep to finish before computing TDR.")
+            return
+
+        if not self.is_calibrated:
+            QMessageBox.critical(self, "Calibration Error",
+                                 "You MUST perform an OSL calibration before calculating Distance to Fault (TDR).")
+            return
+
+        if np.isnan(self.plot_mag_data[0]):
+            QMessageBox.warning(self, "No Data", "No valid sweep data found. Please run a sweep first.")
+            return
+
+        if self.freq_array[0] < self.cal_freq_array[0] or self.freq_array[-1] > self.cal_freq_array[-1]:
+            QMessageBox.critical(self, "Calibration Limits Error",
+                                 f"Current sweep data ({self.freq_array[0]} - {self.freq_array[-1]} MHz) is OUTSIDE the calibrated interval.\nCannot compute accurate TDR.")
+            return
+
+        # 1. Compute TDR Distance
+        mag_linear = 10 ** (self.plot_mag_data / 20)
+        phase_rad = np.radians(self.plot_phase_data)
+        s11_complex = mag_linear * np.exp(1j * phase_rad)
+
+        window_name = self.combo_window.currentText()
+        if window_name != "rectangular":
+            win = get_window(window_name, len(s11_complex))
+            s11_complex = s11_complex * win
+
+        n_fft = 4096
+        tdr_response = np.fft.ifft(s11_complex, n=n_fft)
+        tdr_mag = np.abs(tdr_response)
+
+        bw_hz = (self.freq_array[-1] - self.freq_array[0]) * 1e6
+        df = bw_hz / (len(self.freq_array) - 1)
+        dt = 1.0 / (n_fft * df)
+
+        t_array = np.arange(n_fft) * dt
+        c = 299792458.0
+        vf = self.spin_vf.value()
+        d_array = (t_array * c * vf) / 2.0
+
+        view_limit = 500
+        self.tdr_d_array = d_array[:view_limit]
+        self.tdr_mag_array = tdr_mag[:view_limit]
+
+        self.c_tdr.setData(self.tdr_d_array, self.tdr_mag_array)
+        self.tdr_graph.setXRange(0, self.tdr_d_array[-1], padding=0)
+
+        # 2. Extract Peaks
+        peaks, _ = find_peaks(self.tdr_mag_array, height=0.01, distance=10)
+        self.tdr_fault_table.setRowCount(len(peaks))
+        for i, p_idx in enumerate(peaks):
+            dist = self.tdr_d_array[p_idx]
+            amp = self.tdr_mag_array[p_idx]
+            self.tdr_fault_table.setItem(i, 0, QTableWidgetItem(f"Fault {i + 1}"))
+            self.tdr_fault_table.setItem(i, 1, QTableWidgetItem(f"{dist:.3f}"))
+            self.tdr_fault_table.setItem(i, 2, QTableWidgetItem(f"{amp:.4f}"))
+
+        self.update_tdr_marker_table()
+
+        # 3. Extract Cable Loss vs Frequency
+        # Ignore the first 0.1 meters (connector mismatch) to find the actual far end of the cable
+        valid_indices = np.where(self.tdr_d_array > 0.1)[0]
+        if len(valid_indices) > 0:
+            peak_idx = valid_indices[np.argmax(self.tdr_mag_array[valid_indices])]
+            cable_length = self.tdr_d_array[peak_idx]
+
+            if cable_length > 0.1:
+                valid_len = self.sweep_idx if self.is_sweeping else self.sweep_points
+                valid_len = max(1, valid_len)
+
+                f_arr = self.freq_array[:valid_len]
+                mag_arr = self.plot_mag_data[:valid_len]
+
+                # Raw Loss Calculation (Magnitude is negative return loss, make positive, divide by 2 * L)
+                raw_loss_per_m = np.abs(mag_arr) / (2.0 * cable_length)
+
+                # Polynomial fit to remove standing wave ripples caused by adapter mismatch
+                coeffs = np.polyfit(f_arr, raw_loss_per_m, 2)
+                smooth_loss = np.polyval(coeffs, f_arr)
+
+                self.c_loss_raw.setData(f_arr, raw_loss_per_m)
+                self.c_loss_fit.setData(f_arr, smooth_loss)
+
+                self.loss_graph.setTitle(f"Extracted Cable Loss (Detected Length: {cable_length:.2f} m)")
+                self.loss_graph.setXRange(f_arr[0], f_arr[-1], padding=0)
+
+    def on_tdr_double_click(self, item):
+        row = item.row()
+        dist_str = self.tdr_fault_table.item(row, 1).text()
+        self.tdr_line.setValue(float(dist_str))
+
     def request_next_point(self):
         if self.sweep_idx < self.sweep_points:
             target_freq = self.freq_array[self.sweep_idx]
@@ -534,7 +780,7 @@ class VNAMaster(QMainWindow):
             self.cal_freq_array = self.freq_array.copy()
             self.base_E_D = self.mem_LOAD
             self.base_E_S = (self.mem_OPEN + self.mem_SHORT - 2 * self.mem_LOAD) / (
-                        self.mem_OPEN - self.mem_SHORT + 1e-12j)
+                    self.mem_OPEN - self.mem_SHORT + 1e-12j)
             self.base_E_T = (self.mem_OPEN - self.mem_LOAD) * (1 - self.base_E_S)
             self.is_calibrated = True
             self.info_label.setText("OSL Calibration Complete. Matrix Generated.")
@@ -586,6 +832,13 @@ class VNAMaster(QMainWindow):
                             self.mem_SHORT[self.sweep_idx] = S11
                         elif self.sweep_mode == 'LOAD':
                             self.mem_LOAD[self.sweep_idx] = S11
+
+                    delay_ps = self.spin_ed.value()
+                    if delay_ps != 0.0:
+                        f_hz = self.freq_array[self.sweep_idx] * 1e6
+                        t_sec = delay_ps * 1e-12
+                        phase_shift = 4.0 * np.pi * f_hz * t_sec
+                        S11 = S11 * np.exp(1j * phase_shift)
 
                     mag_db = 20 * np.log10(abs(S11) + 1e-12)
                     phase_deg = np.degrees(np.angle(S11))
