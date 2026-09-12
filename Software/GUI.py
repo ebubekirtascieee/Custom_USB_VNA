@@ -23,7 +23,7 @@ def interp_complex(x_new, x_old, y_complex):
 class VNAMaster(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VNA Metrology Engine: S11, Port Extension & TDR")
+        self.setWindowTitle("VNA Metrology Engine: S11, TDR & Time-Domain Gating")
         self.resize(1600, 950)
         self.port = None
         self.rx_buffer = bytearray()
@@ -250,7 +250,6 @@ class VNAMaster(QMainWindow):
 
         tdr_body = QHBoxLayout()
 
-        # Left Panel: Distance Plot & Loss Plot
         tdr_left_panel = QWidget()
         tdr_left_layout = QVBoxLayout(tdr_left_panel)
         tdr_left_layout.setContentsMargins(0, 0, 0, 0)
@@ -263,19 +262,16 @@ class VNAMaster(QMainWindow):
         self.tdr_graph.addItem(self.tdr_line)
         self.tdr_graph.scene().sigMouseClicked.connect(self.on_tdr_mouse_click)
 
-        self.loss_graph = pg.PlotWidget(title="Extracted Cable Loss (dB/m vs Frequency)")
+        self.loss_graph = pg.PlotWidget(title="Extracted Cable Loss")
         self.loss_graph.showGrid(x=True, y=True, alpha=0.4)
         self.loss_graph.setLabel('bottom', "Frequency (MHz)")
         self.loss_graph.setLabel('left', "Loss (dB/m)")
-        # Raw mathematical loss (faded gray)
         self.c_loss_raw = self.loss_graph.plot(pen=pg.mkPen(color=(150, 150, 150), width=1, style=Qt.PenStyle.DashLine))
-        # Polynomial fit smoothing (bright yellow)
         self.c_loss_fit = self.loss_graph.plot(pen=pg.mkPen('y', width=2))
 
         tdr_left_layout.addWidget(self.tdr_graph)
         tdr_left_layout.addWidget(self.loss_graph)
 
-        # Right Panel: Tables
         tdr_right_panel = QWidget()
         tdr_right_layout = QVBoxLayout(tdr_right_panel)
         tdr_right_layout.setContentsMargins(0, 0, 0, 0)
@@ -311,6 +307,74 @@ class VNAMaster(QMainWindow):
         tdr_layout.addLayout(tdr_body)
 
         self.tabs.addTab(self.tdr_panel, "Time Domain (TDR) & Diagnostics")
+
+        # === TAB 3: TIME-DOMAIN GATING (Anechoic Simulator) ===
+        self.gating_panel = QWidget()
+        gating_layout = QHBoxLayout(self.gating_panel)
+        gating_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.gating_graph = pg.PlotWidget(title="Time-Domain Gating (Absolute Time Limits)")
+        self.gating_graph.showGrid(x=True, y=True, alpha=0.4)
+        self.gating_graph.setLabel('bottom', "One-Way Time (ns)")
+        self.c_gating_tdr = self.gating_graph.plot(pen=pg.mkPen('m', width=2))
+
+        self.gate_line_start = pg.InfiniteLine(pos=1.0, angle=90, movable=True,
+                                               pen=pg.mkPen('y', width=2, style=Qt.PenStyle.DashLine))
+        self.gate_line_stop = pg.InfiniteLine(pos=5.0, angle=90, movable=True,
+                                              pen=pg.mkPen('y', width=2, style=Qt.PenStyle.DashLine))
+        self.gating_graph.addItem(self.gate_line_start)
+        self.gating_graph.addItem(self.gate_line_stop)
+
+        gating_right_panel = QWidget()
+        gating_right_layout = QVBoxLayout(gating_right_panel)
+
+        self.btn_load_gating = QPushButton("1. Load Current Sweep")
+        self.btn_load_gating.clicked.connect(self.load_gating_data)
+
+        gating_right_layout.addWidget(QLabel("Gate Start (ns):"))
+        self.spin_gate_start = QDoubleSpinBox()
+        self.spin_gate_start.setRange(0.0, 5000.0)
+        self.spin_gate_start.setValue(1.0)
+        gating_right_layout.addWidget(self.spin_gate_start)
+
+        gating_right_layout.addWidget(QLabel("Gate Stop (ns):"))
+        self.spin_gate_stop = QDoubleSpinBox()
+        self.spin_gate_stop.setRange(0.0, 5000.0)
+        self.spin_gate_stop.setValue(5.0)
+        gating_right_layout.addWidget(self.spin_gate_stop)
+
+        self.btn_apply_gate = QPushButton("2. Apply Gate & View S11")
+        self.btn_apply_gate.setStyleSheet("background-color: #008800; color: white;")
+        self.btn_apply_gate.clicked.connect(self.apply_gating)
+
+        self.btn_restore_s11 = QPushButton("Restore Original S11")
+        self.btn_restore_s11.setStyleSheet("background-color: #880000; color: white;")
+        self.btn_restore_s11.clicked.connect(self.restore_s11)
+
+        gating_right_layout.addWidget(self.btn_load_gating)
+        gating_right_layout.addSpacing(20)
+        gating_right_layout.addWidget(self.btn_apply_gate)
+        gating_right_layout.addWidget(self.btn_restore_s11)
+        gating_right_layout.addStretch()
+
+        gating_layout.addWidget(self.gating_graph, stretch=3)
+        gating_layout.addWidget(gating_right_panel, stretch=1)
+
+        self.tabs.addTab(self.gating_panel, "Time-Domain Gating")
+
+        def sync_gate_start(): self.spin_gate_start.setValue(self.gate_line_start.value())
+
+        def sync_gate_stop(): self.spin_gate_stop.setValue(self.gate_line_stop.value())
+
+        def sync_spin_start(): self.gate_line_start.setValue(self.spin_gate_start.value())
+
+        def sync_spin_stop(): self.gate_line_stop.setValue(self.spin_gate_stop.value())
+
+        self.gate_line_start.sigPositionChanged.connect(sync_gate_start)
+        self.gate_line_stop.sigPositionChanged.connect(sync_gate_stop)
+        self.spin_gate_start.valueChanged.connect(sync_spin_start)
+        self.spin_gate_stop.valueChanged.connect(sync_spin_stop)
+
         layout.addWidget(self.tabs, stretch=2)
 
         # === ADC PANEL ===
@@ -626,7 +690,7 @@ class VNAMaster(QMainWindow):
         if mode == 'NORMAL' and self.is_calibrated:
             if start_f < self.cal_freq_array[0] or stop_f > self.cal_freq_array[-1]:
                 QMessageBox.critical(self, "Calibration Error",
-                                     f"Sweep range ({start_f} - {stop_f} MHz) is OUTSIDE the calibrated bounds ({self.cal_freq_array[0]:.1f} - {self.cal_freq_array[-1]:.1f} MHz).\nPlease adjust sweep bounds or re-calibrate.")
+                                     f"Sweep range ({start_f} - {stop_f} MHz) is OUTSIDE the calibrated bounds.\nPlease adjust sweep bounds or re-calibrate.")
                 return
             if pts > len(self.cal_freq_array):
                 QMessageBox.warning(self, "Upscaling Warning",
@@ -660,6 +724,94 @@ class VNAMaster(QMainWindow):
         self.info_label.setStyleSheet("color: #FFFF00; background-color: #111;")
         self.request_next_point()
 
+    def load_gating_data(self):
+        if self.is_sweeping:
+            QMessageBox.warning(self, "Sweep In Progress", "Please wait for the frequency sweep to finish.")
+            return
+        if np.isnan(self.raw_mag_data[0]):
+            QMessageBox.warning(self, "No Data", "No valid sweep data found. Run a sweep first.")
+            return
+
+        mag_linear = 10 ** (self.raw_mag_data / 20)
+        phase_rad = np.radians(self.raw_phase_data)
+        s11_complex = mag_linear * np.exp(1j * phase_rad)
+
+        n_fft = 4096
+        tdr_response = np.fft.ifft(s11_complex, n=n_fft)
+        tdr_mag = np.abs(tdr_response)
+
+        bw_hz = (self.freq_array[-1] - self.freq_array[0]) * 1e6
+        df = bw_hz / (len(self.freq_array) - 1)
+        dt = 1.0 / (n_fft * df)
+
+        # Convert absolute time to nanoseconds (One-Way Delay to match physical intuition)
+        self.gating_t_array = (np.arange(n_fft) * dt * 1e9) / 2.0
+        self.gating_tdr_complex = tdr_response
+
+        view_limit = 500
+        self.c_gating_tdr.setData(self.gating_t_array[:view_limit], tdr_mag[:view_limit])
+        self.gating_graph.setXRange(0, self.gating_t_array[view_limit], padding=0)
+
+    def apply_gating(self):
+        if not hasattr(self, 'gating_tdr_complex'):
+            QMessageBox.warning(self, "No Data", "Click 'Load Current Sweep' to initialize gating data first.")
+            return
+
+        start_ns = min(self.spin_gate_start.value(), self.spin_gate_stop.value())
+        stop_ns = max(self.spin_gate_start.value(), self.spin_gate_stop.value())
+
+        idx_start = np.searchsorted(self.gating_t_array, start_ns)
+        idx_stop = np.searchsorted(self.gating_t_array, stop_ns)
+
+        gate_len = idx_stop - idx_start
+        mask = np.zeros(len(self.gating_tdr_complex))
+
+        if gate_len > 0:
+            mask[idx_start:idx_stop] = get_window(('tukey', 0.2), gate_len)
+
+        gated_tdr = self.gating_tdr_complex * mask
+
+        gated_s11_full = np.fft.fft(gated_tdr)
+        gated_s11 = gated_s11_full[:self.sweep_points]
+
+        self.plot_mag_data = 20 * np.log10(np.abs(gated_s11) + 1e-12)
+        self.plot_phase_data = np.degrees(np.angle(gated_s11))
+
+        self.c_mag.setData(self.freq_array, self.plot_mag_data)
+        self.c_phase.setData(self.freq_array, self.plot_phase_data)
+
+        self.c_smith.setData(np.real(gated_s11), np.imag(gated_s11))
+        self.update_marker_table()
+
+        self.tabs.setCurrentIndex(0)
+        self.info_label.setText(f"Time-Domain Gating Applied: [{start_ns:.2f}ns - {stop_ns:.2f}ns]")
+        self.info_label.setStyleSheet("color: #00FF00; background-color: #111;")
+
+    def restore_s11(self):
+        if np.isnan(self.raw_mag_data[0]):
+            return
+
+        filter_txt = self.combo_filter.currentText()
+        if filter_txt != "Off":
+            k = int(filter_txt.split(' ')[0])
+            self.plot_mag_data = medfilt(self.raw_mag_data, kernel_size=k)
+            self.plot_phase_data = medfilt(self.raw_phase_data, kernel_size=k)
+        else:
+            self.plot_mag_data = self.raw_mag_data.copy()
+            self.plot_phase_data = self.raw_phase_data.copy()
+
+        self.c_mag.setData(self.freq_array, self.plot_mag_data)
+        self.c_phase.setData(self.freq_array, self.plot_phase_data)
+
+        mag_linear = 10 ** (self.plot_mag_data / 20)
+        phase_rad = np.radians(self.plot_phase_data)
+        s11_complex = mag_linear * np.exp(1j * phase_rad)
+        self.c_smith.setData(np.real(s11_complex), np.imag(s11_complex))
+
+        self.update_marker_table()
+        self.tabs.setCurrentIndex(0)
+        self.info_label.setText("Original S11 Data Restored.")
+
     def update_tdr(self):
         if self.is_sweeping:
             QMessageBox.warning(self, "Sweep In Progress",
@@ -680,7 +832,6 @@ class VNAMaster(QMainWindow):
                                  f"Current sweep data ({self.freq_array[0]} - {self.freq_array[-1]} MHz) is OUTSIDE the calibrated interval.\nCannot compute accurate TDR.")
             return
 
-        # 1. Compute TDR Distance
         mag_linear = 10 ** (self.plot_mag_data / 20)
         phase_rad = np.radians(self.plot_phase_data)
         s11_complex = mag_linear * np.exp(1j * phase_rad)
@@ -710,7 +861,6 @@ class VNAMaster(QMainWindow):
         self.c_tdr.setData(self.tdr_d_array, self.tdr_mag_array)
         self.tdr_graph.setXRange(0, self.tdr_d_array[-1], padding=0)
 
-        # 2. Extract Peaks
         peaks, _ = find_peaks(self.tdr_mag_array, height=0.01, distance=10)
         self.tdr_fault_table.setRowCount(len(peaks))
         for i, p_idx in enumerate(peaks):
@@ -722,8 +872,6 @@ class VNAMaster(QMainWindow):
 
         self.update_tdr_marker_table()
 
-        # 3. Extract Cable Loss vs Frequency
-        # Ignore the first 0.1 meters (connector mismatch) to find the actual far end of the cable
         valid_indices = np.where(self.tdr_d_array > 0.1)[0]
         if len(valid_indices) > 0:
             peak_idx = valid_indices[np.argmax(self.tdr_mag_array[valid_indices])]
@@ -736,10 +884,7 @@ class VNAMaster(QMainWindow):
                 f_arr = self.freq_array[:valid_len]
                 mag_arr = self.plot_mag_data[:valid_len]
 
-                # Raw Loss Calculation (Magnitude is negative return loss, make positive, divide by 2 * L)
                 raw_loss_per_m = np.abs(mag_arr) / (2.0 * cable_length)
-
-                # Polynomial fit to remove standing wave ripples caused by adapter mismatch
                 coeffs = np.polyfit(f_arr, raw_loss_per_m, 2)
                 smooth_loss = np.polyval(coeffs, f_arr)
 
