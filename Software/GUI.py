@@ -725,36 +725,46 @@ class VNAMaster(QMainWindow):
         self.request_next_point()
 
     def load_gating_data(self):
-        if self.is_sweeping:
-            QMessageBox.warning(self, "Sweep In Progress", "Please wait for the frequency sweep to finish.")
-            return
-        if np.isnan(self.raw_mag_data[0]):
-            QMessageBox.warning(self, "No Data", "No valid sweep data found. Run a sweep first.")
+        if len(self.freq_array) == 0:
+            QMessageBox.warning(self, "No Data", "Load a .s1p file first (or run a sweep).")
             return
 
         mag_linear = 10 ** (self.raw_mag_data / 20)
         phase_rad = np.radians(self.raw_phase_data)
         s11_complex = mag_linear * np.exp(1j * phase_rad)
 
-        n_fft = 4096
-        tdr_response = np.fft.ifft(s11_complex, n=n_fft)
+        f_hz = self.freq_array * 1e6
+        df_hz = f_hz[1] - f_hz[0]
+        
+        self.start_idx = int(round(f_hz[0] / df_hz))
+
+        min_n_fft = self.start_idx + self.sweep_points
+        self.n_fft = 2 ** int(np.ceil(np.log2(min_n_fft * 1.2))) # Next power of 2
+        if self.n_fft < 4096: self.n_fft = 4096
+
+        padded_s11 = np.zeros(self.n_fft, dtype=complex)
+        padded_s11[self.start_idx : self.start_idx + self.sweep_points] = s11_complex
+
+        tdr_response = np.fft.ifft(padded_s11)
         tdr_mag = np.abs(tdr_response)
 
-        bw_hz = (self.freq_array[-1] - self.freq_array[0]) * 1e6
-        df = bw_hz / (len(self.freq_array) - 1)
-        dt = 1.0 / (n_fft * df)
-
-        # Convert absolute time to nanoseconds (One-Way Delay to match physical intuition)
-        self.gating_t_array = (np.arange(n_fft) * dt * 1e9) / 2.0
+        dt = 1.0 / (self.n_fft * df_hz)
+        self.gating_t_array = (np.arange(self.n_fft) * dt * 1e9) / 2.0
         self.gating_tdr_complex = tdr_response
 
-        view_limit = 500
+        # Plot limits (Auto scale view to 100ns or max 500 points)
+        view_limit = np.searchsorted(self.gating_t_array, 100.0)
+        view_limit = max(500, min(view_limit, len(self.gating_t_array)-1))
+        
         self.c_gating_tdr.setData(self.gating_t_array[:view_limit], tdr_mag[:view_limit])
         self.gating_graph.setXRange(0, self.gating_t_array[view_limit], padding=0)
+        
+        self.info_label.setText("Gating Arrays Initialized. (True RF Bandpass Mapping Applied)")
+        self.info_label.setStyleSheet("color: #00FF00; background-color: #111; padding: 10px;")
 
     def apply_gating(self):
         if not hasattr(self, 'gating_tdr_complex'):
-            QMessageBox.warning(self, "No Data", "Click 'Load Current Sweep' to initialize gating data first.")
+            QMessageBox.warning(self, "No Data", "Click 'Initialize Gating Arrays' first.")
             return
 
         start_ns = min(self.spin_gate_start.value(), self.spin_gate_stop.value())
@@ -767,25 +777,41 @@ class VNAMaster(QMainWindow):
         mask = np.zeros(len(self.gating_tdr_complex))
 
         if gate_len > 0:
-            mask[idx_start:idx_stop] = get_window(('tukey', 0.2), gate_len)
+            window = get_window(('tukey', 0.2), gate_len)
+            
+            # CRITICAL FIX: If the gate includes t=0, do not taper the left edge to 0!
+            # Tapering t=0 destroys the main reference plane reflection, causing absurd phase wrap.
 
+            if idx_start == 0:
+                mid_point = gate_len // 2
+                window[:mid_point] = 1.0
+                
+            mask[idx_start:idx_stop] = window
+
+        # Gate the time domain
         gated_tdr = self.gating_tdr_complex * mask
-
+        
+        # FFT back to frequency domain
         gated_s11_full = np.fft.fft(gated_tdr)
-        gated_s11 = gated_s11_full[:self.sweep_points]
-
+        
+        gated_s11 = gated_s11_full[self.start_idx : self.start_idx + self.sweep_points]
+        
         self.plot_mag_data = 20 * np.log10(np.abs(gated_s11) + 1e-12)
         self.plot_phase_data = np.degrees(np.angle(gated_s11))
 
         self.c_mag.setData(self.freq_array, self.plot_mag_data)
         self.c_phase.setData(self.freq_array, self.plot_phase_data)
 
-        self.c_smith.setData(np.real(gated_s11), np.imag(gated_s11))
+        mag_linear = 10 ** (self.plot_mag_data / 20)
+        phase_rad = np.radians(self.plot_phase_data)
+        s11_complex = mag_linear * np.exp(1j * phase_rad)
+        self.c_smith.setData(np.real(s11_complex), np.imag(s11_complex))
+        
         self.update_marker_table()
 
         self.tabs.setCurrentIndex(0)
         self.info_label.setText(f"Time-Domain Gating Applied: [{start_ns:.2f}ns - {stop_ns:.2f}ns]")
-        self.info_label.setStyleSheet("color: #00FF00; background-color: #111;")
+        self.info_label.setStyleSheet("color: #FFFF00; background-color: #111; padding: 10px;")
 
     def restore_s11(self):
         if np.isnan(self.raw_mag_data[0]):
