@@ -14,11 +14,9 @@ Time Domain Reflectometry (TDR) for distance-to-fault calculations and automated
 
 <img width="1919" height="1037" alt="Cable_Loss" src="https://github.com/user-attachments/assets/26ee5f5a-6841-48af-a977-b1b0d656f6ef" />
 
-"Multi-Band Antenna Analysis" benchmark results with varied commercial VNAs.
+"Multi-Band Antenna Analysis" benchmark results against varied commercial VNAs, overall ~80% metrological accuracy.
 
 <img width="11546" height="9605" alt="MASTER_Benchmark_Overview" src="https://github.com/user-attachments/assets/ec4f6063-ef2e-4cc3-b488-7c4a1ace4369" />
-
-
 <img width="4032" height="3024" alt="Test_Fixture" src="https://github.com/user-attachments/assets/19af23e6-a2de-4c6a-b22c-ed75018e5756" />
 
 
